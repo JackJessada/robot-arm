@@ -24,3 +24,10 @@ n_eval_episodes: 20
 # Output
 output_dir: "./checkpoints/grpo_smolvla"
 log_dir: "./runs/grpo_smolvla"
+
+# Logging & Video
+wandb:
+  enable: true
+  project: "grpo-smolvla-libero"
+  entity: null
+video_dir: "./checkpoints/grpo_smolvla/videos"

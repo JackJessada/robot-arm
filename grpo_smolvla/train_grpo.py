@@ -7,7 +7,9 @@ import random
 # Must be set before the CUDA allocator initialises (before first .to("cuda"))
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
+import imageio
 import torch
+import wandb
 import yaml
 from huggingface_hub import hf_hub_download
 from libero.libero import benchmark
@@ -104,6 +106,14 @@ def build_optimizer(policy, cfg):
 def train(cfg):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    
+    if cfg.get("wandb", {}).get("enable", False):
+        wandb.init(
+            project=cfg["wandb"].get("project", "grpo-smolvla-libero"),
+            entity=cfg["wandb"].get("entity", None),
+            config=cfg,
+            name=f"grpo_{cfg['task_suite']}",
+        )
 
     print(f"Loading policy from {cfg['model_id']} ...")
     policy = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device=device, dtype=torch.bfloat16)
@@ -181,8 +191,15 @@ def train(cfg):
         mean_r = sum(rewards) / len(rewards)
         print(f"Step {step:5d} | loss={loss:.4f} | mean_reward={mean_r:.3f} | task={task_language[:40]}")
 
+        if cfg.get("wandb", {}).get("enable", False):
+            wandb.log({
+                "train/loss": loss,
+                "train/mean_reward": mean_r,
+                "train/step": step,
+            })
+
         if step > 0 and step % cfg["eval_every"] == 0:
-            _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, postprocessor, device)
+            _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, postprocessor, device, step)
 
         if step > 0 and step % cfg["save_every"] == 0:
             ckpt_path = os.path.join(cfg["output_dir"], f"step_{step}")
@@ -197,12 +214,20 @@ def train(cfg):
     print(f"Training complete. Final checkpoint → {final_path}")
 
 
-def _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, postprocessor, device):
+def _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, postprocessor, device, step):
     """Quick eval on 3 random tasks, 5 episodes each, using the same pipeline as evaluate.py."""
     policy.eval()
     n_sample = min(3, n_tasks)
     task_ids = random.sample(range(n_tasks), n_sample)
     results = []
+    
+    # Video tracking
+    video_dir = cfg.get("video_dir", "./checkpoints/grpo_smolvla/videos")
+    os.makedirs(video_dir, exist_ok=True)
+    saved_success = 0
+    saved_fail = 0
+    max_videos_per_type = 4
+
     for tid in task_ids:
         env = LiberoEnv(
             task_suite=suite,
@@ -214,12 +239,18 @@ def _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, pos
         )
         n_ep = cfg.get("n_eval_episodes", 5)
         success_count = 0
-        for _ in range(n_ep):
+        
+        for ep in range(n_ep):
             policy.reset()
             obs, info = env.reset()
             task_language = env.task_description
             done = False
+            frames = []
+            
             for _step in range(env._max_episode_steps):
+                # Capture frame for video (agentview, rgb, flipped to right side up)
+                frames.append(obs["pixels"]["image"][::-1, :, :].copy())
+
                 obs_t = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
                 obs_t = cast_batch(obs_t, next(policy.parameters()).dtype)
                 with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
@@ -229,13 +260,34 @@ def _quick_eval(policy, suite, n_tasks, cfg, env_preprocessor, preprocessor, pos
                 obs, _, terminated, truncated, info = env.step(act_np)
                 done = terminated or truncated
                 if done:
-                    if info.get("is_success", False):
+                    is_success = info.get("is_success", False)
+                    if is_success:
                         success_count += 1
+                    
+                    # Save video if needed
+                    if is_success and saved_success < max_videos_per_type:
+                        vid_path = os.path.join(video_dir, f"step_{step}_task_{tid}_ep_{ep}_success.mp4")
+                        imageio.mimsave(vid_path, frames, fps=30)
+                        saved_success += 1
+                        if cfg.get("wandb", {}).get("enable", False):
+                            wandb.log({f"video/success_{saved_success}": wandb.Video(vid_path, format="mp4")})
+                    
+                    elif not is_success and saved_fail < max_videos_per_type:
+                        vid_path = os.path.join(video_dir, f"step_{step}_task_{tid}_ep_{ep}_fail.mp4")
+                        imageio.mimsave(vid_path, frames, fps=30)
+                        saved_fail += 1
+                        if cfg.get("wandb", {}).get("enable", False):
+                            wandb.log({f"video/fail_{saved_fail}": wandb.Video(vid_path, format="mp4")})
+                    
                     break
         results.append(success_count / n_ep)
         env.close()
+    
     mean_sr = sum(results) / len(results)
     print(f"  [Quick eval] mean success rate = {mean_sr:.3f}")
+    if cfg.get("wandb", {}).get("enable", False):
+        wandb.log({"eval/mean_success_rate": mean_sr, "train/step": step})
+        
     policy.train()
 
 

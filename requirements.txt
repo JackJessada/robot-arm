@@ -1,0 +1,7 @@
+# Dependencies for GRPO-SmolVLA
+wandb
+imageio
+imageio-ffmpeg
+# lerobot[smolvla] is installed separately as per Installation.md
+# but we can list it here for tracking
+lerobot[smolvla]
