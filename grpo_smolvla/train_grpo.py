@@ -171,15 +171,27 @@ def train(cfg):
         obs_batch = preprocess_obs(obs, task_language, env_preprocessor, preprocessor, device)
         obs_batch = cast_batch(obs_batch, next(policy.parameters()).dtype)
 
-        # Sample group of n trajectories (prefix KV-cache computed once for all n)
-        group_data = sample_group_trajectories(policy, obs_batch, n_group=cfg["n_group"])
+        # Resampling Guard: Retry sampling if all rewards in the group are identical
+        guard_cfg = cfg.get("resampling_guard", {})
+        max_retries = guard_cfg.get("max_retries", 3) if guard_cfg.get("enable", False) else 0
+        
+        for attempt in range(max_retries + 1):
+            # Sample group of n trajectories (prefix KV-cache computed once for all n)
+            group_data = sample_group_trajectories(policy, obs_batch, n_group=cfg["n_group"])
 
-        # Compute weighted rewards from the shared initial sim state
-        raw_env = env._env  # OffScreenRenderEnv — needed for sim state save/restore
-        rewards = []
-        for traj in group_data:
-            r = compute_weighted_reward(raw_env, traj, postprocessor)
-            rewards.append(r)
+            # Compute weighted rewards from the shared initial sim state
+            raw_env = env._env  # OffScreenRenderEnv — needed for sim state save/restore
+            rewards = []
+            for traj in group_data:
+                r = compute_weighted_reward(raw_env, traj, postprocessor)
+                rewards.append(r)
+            
+            # Check for diversity: if we have more than one unique reward value, we're good
+            if len(set(rewards)) > 1 or max_retries == 0:
+                break
+            
+            if attempt < max_retries:
+                print(f"  [step {step}] Attempt {attempt}: All rewards are {rewards[0]} - Retrying group sampling...")
 
         advantages = compute_grpo_advantages(rewards)
 

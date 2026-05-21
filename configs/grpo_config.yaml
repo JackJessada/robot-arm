@@ -31,3 +31,8 @@ wandb:
   project: "grpo-smolvla-libero"
   entity: null
 video_dir: "./checkpoints/grpo_smolvla/videos"
+
+# Resampling Guard (Diversity Protection)
+resampling_guard:
+  enable: true
+  max_retries: 3
