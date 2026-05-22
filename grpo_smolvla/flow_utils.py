@@ -49,26 +49,45 @@ def expand_kv(pkv, bsize):
     if pkv is None:
         return None
     
+    # DEBUG: Inspect the first layer's structure
+    print(f"DEBUG: pkv type: {type(pkv)}")
+    if isinstance(pkv, (list, tuple)) and len(pkv) > 0:
+        first_layer = pkv[0]
+        print(f"DEBUG: first layer type: {type(first_layer)}")
+        if isinstance(first_layer, dict):
+            print(f"DEBUG: first layer keys: {first_layer.keys()}")
+            for k, v in first_layer.items():
+                if isinstance(v, torch.Tensor):
+                    print(f"DEBUG: key '{k}' shape: {v.shape}")
+        elif isinstance(first_layer, (tuple, list)):
+            for i, v in enumerate(first_layer):
+                if isinstance(v, torch.Tensor):
+                    print(f"DEBUG: index {i} shape: {v.shape}")
+
     # Handle newer Transformers Cache objects (DynamicCache, etc.)
     if hasattr(pkv, "batch_repeat"):
         return pkv.batch_repeat(bsize)
     
-    if isinstance(pkv, tuple):
+    if isinstance(pkv, (tuple, list)):
         res = []
         for item in pkv:
-            if isinstance(item, tuple):
+            if isinstance(item, dict):
+                # Handle list of dicts: [ {"key_states": t1, "value_states": t2}, ... ]
+                new_dict = {}
+                for k, v in item.items():
+                    new_dict[k] = v.expand(bsize, *v.shape[1:]) if isinstance(v, torch.Tensor) else v
+                res.append(new_dict)
+            elif isinstance(item, (tuple, list)):
                 # Standard format: tuple of (key_states, value_states) per layer
-                # Each state is (batch, num_heads, sequence_length, head_dim)
                 res.append(tuple(
                     t.expand(bsize, *t.shape[1:]) if isinstance(t, torch.Tensor) else t
                     for t in item
                 ))
             elif isinstance(item, torch.Tensor):
-                # Some models might have a flat list of tensors
                 res.append(item.expand(bsize, *item.shape[1:]))
             else:
                 res.append(item)
-        return tuple(res)
+        return tuple(res) if isinstance(pkv, tuple) else res
     
     return pkv
 
