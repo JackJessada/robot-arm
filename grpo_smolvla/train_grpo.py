@@ -171,11 +171,14 @@ def train(cfg):
             
             # Reset local env to get observation
             obs, info = env.reset()
-            # Sync local env with our chosen init_state_idx
-            obs = env._env.set_init_state(suite.get_task_init_states(task_id)[init_state_idx])
-            # Stabilize local env too so obs matches what workers see
+            # Sync local env with our chosen init_state_idx (using the underlying raw env)
+            env._env.set_init_state(suite.get_task_init_states(task_id)[init_state_idx])
+            
+            # Stabilize local env too so obs matches what workers see.
+            # We call the wrapper's step() to ensure we get the correctly formatted observation dict.
             import numpy as np
-            for _ in range(10): env.step(np.zeros(7))
+            for _ in range(10): 
+                obs, _, _, _, info = env.step(np.zeros(7))
             
             task_language = env.task_description
         except Exception as e:
