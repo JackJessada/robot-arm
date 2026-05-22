@@ -22,7 +22,7 @@ from lerobot.processor.env_processor import LiberoProcessorStep
 from safetensors.torch import load_file
 
 from grpo_smolvla.flow_utils import sample_group_trajectories
-from grpo_smolvla.grpo import compute_grpo_advantages, grpo_update
+from grpo_smolvla.grpo import compute_grpo_advantages, grpo_update, flow_matching_log_prob
 from grpo_smolvla.rewards import compute_weighted_reward
 
 
@@ -117,12 +117,10 @@ def train(cfg):
 
     print(f"Loading policy from {cfg['model_id']} ...")
     policy = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device=device, dtype=torch.bfloat16)
-    policy_ref = SmolVLAPolicy.from_pretrained(cfg["model_id"]).to(device=device, dtype=torch.bfloat16)
-    policy_ref.requires_grad_(False)
 
     # Gradient checkpointing on the VLM backbone recomputes activations during
     # backward instead of storing them, trading ~2x compute for ~60% less activation
-    # memory. Only needed on the trainable policy (policy_ref never calls backward).
+    # memory.
     vlm = policy.model.vlm_with_expert.vlm
     if hasattr(vlm, "gradient_checkpointing_enable"):
         vlm.gradient_checkpointing_enable(
@@ -195,9 +193,17 @@ def train(cfg):
 
         advantages = compute_grpo_advantages(rewards)
 
+        # Pre-calculate log_probs_old before the update (without grad)
+        with torch.no_grad():
+            log_probs_old = []
+            for traj in group_data:
+                lp = flow_matching_log_prob(policy, obs_batch, traj["noise"], traj["actions_10"])
+                log_probs_old.append(lp)
+            log_probs_old = torch.stack(log_probs_old)
+
         loss = grpo_update(
-            policy, policy_ref, optimizer, obs_batch, group_data, advantages,
-            clip_eps=cfg["clip_eps"], kl_coeff=cfg["kl_coeff"],
+            policy, optimizer, obs_batch, group_data, log_probs_old, advantages,
+            clip_eps=cfg["clip_eps"]
         )
 
         mean_r = sum(rewards) / len(rewards)

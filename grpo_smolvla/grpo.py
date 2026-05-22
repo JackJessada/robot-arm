@@ -37,20 +37,19 @@ def flow_matching_log_prob(policy, obs_batch, noise, actions_target):
     return -loss  # tensor with gradient path intact
 
 
-def grpo_update(policy, policy_ref, optimizer, obs_batch, group_data, advantages, clip_eps=0.2, kl_coeff=0.01):
+def grpo_update(policy, optimizer, obs_batch, group_data, log_probs_old, advantages, clip_eps=0.2):
     """
-    L_GRPO = -E[min(ρ_i * Â_i, clip(ρ_i, 1-ε, 1+ε) * Â_i)] + kl_coeff * KL(π_θ || π_ref)
+    L_GRPO = -E[min(ρ_i * Â_i, clip(ρ_i, 1-ε, 1+ε) * Â_i)]
+    
+    ρ_i = exp(log π_θ(τ_i) - log π_old(τ_i))
 
-    ρ_i = exp(log π_θ(τ_i) - log π_θ_old(τ_i))
-
-    policy:     trainable SmolVLAPolicy
-    policy_ref: frozen SFT reference policy (requires_grad=False)
-    optimizer:  AdamW with differential LRs
-    obs_batch:  observation dict
-    group_data: list of dicts with keys noise, actions_8, actions_9, actions_10
-    advantages: FloatTensor of shape (n,) from compute_grpo_advantages
-    clip_eps:   PPO clipping threshold (default 0.2)
-    kl_coeff:   KL regularization weight against SFT prior
+    policy:         trainable SmolVLAPolicy
+    optimizer:      AdamW with differential LRs
+    obs_batch:      observation dict
+    group_data:     list of dicts with keys noise, actions_8, actions_9, actions_10
+    log_probs_old:  Tensor of shape (n,) containing detached log-probs from sampling time
+    advantages:     FloatTensor of shape (n,) from compute_grpo_advantages
+    clip_eps:       PPO clipping threshold (default 0.2)
 
     Returns: scalar loss float
     """
@@ -59,25 +58,21 @@ def grpo_update(policy, policy_ref, optimizer, obs_batch, group_data, advantages
     running_loss = 0.0
 
     optimizer.zero_grad()
-    for traj, adv in zip(group_data, advantages):
+    for i, (traj, adv) in enumerate(zip(group_data, advantages)):
         adv = adv.to(device)
+        lp_old = log_probs_old[i].to(device)
 
         log_prob_new = flow_matching_log_prob(
             policy, obs_batch, traj["noise"], traj["actions_10"]
         )
-        with torch.no_grad():
-            log_prob_ref = flow_matching_log_prob(
-                policy_ref, obs_batch, traj["noise"], traj["actions_10"]
-            )
 
-        ratio = torch.exp(log_prob_new - log_prob_ref.detach())
+        ratio = torch.exp(log_prob_new - lp_old)
         clipped_ratio = torch.clamp(ratio, 1 - clip_eps, 1 + clip_eps)
 
         policy_loss = -torch.min(ratio * adv, clipped_ratio * adv)
-        kl_penalty = kl_coeff * (log_prob_new - log_prob_ref.detach())
 
         # Divide by n here so accumulated gradients equal the mean over the group
-        step_loss = (policy_loss + kl_penalty) / n
+        step_loss = policy_loss / n
         step_loss.backward()
         running_loss += step_loss.item()
 
