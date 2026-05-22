@@ -44,7 +44,7 @@ def compute_prefix_cache(policy, obs_batch):
 def expand_kv(pkv, bsize):
     """
     Safely expand past_key_values to a new batch size.
-    Handles nested tuples, transformers Cache objects, and flat tensor lists.
+    Handles nested tuples (standard Transformers format).
     """
     if pkv is None:
         return None
@@ -56,17 +56,17 @@ def expand_kv(pkv, bsize):
     if isinstance(pkv, tuple):
         res = []
         for item in pkv:
-            if isinstance(item, (tuple, list)):
-                # Nested structure: ( (k, v), (k, v), ... )
+            if isinstance(item, tuple):
+                # Standard format: tuple of (key_states, value_states) per layer
+                # Each state is (batch, num_heads, sequence_length, head_dim)
                 res.append(tuple(
                     t.expand(bsize, *t.shape[1:]) if isinstance(t, torch.Tensor) else t
                     for t in item
                 ))
             elif isinstance(item, torch.Tensor):
-                # Flat structure: ( t1, t2, ... )
+                # Some models might have a flat list of tensors
                 res.append(item.expand(bsize, *item.shape[1:]))
             else:
-                # Keep as-is (handles the 'int' that caused the error)
                 res.append(item)
         return tuple(res)
     
@@ -87,13 +87,17 @@ def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
     device = noise.device
 
     # Expand prefix cache to match the batch size of the noise tensor
+    # expanded_pad_masks: (B, seq_len)
     expanded_pad_masks = prefix_cache["prefix_pad_masks"].expand(bsize, -1)
+    # expanded_past_key_values: nested tuples with batch dimension bsize
     expanded_past_key_values = expand_kv(prefix_cache["past_key_values"], bsize)
 
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=noise.dtype, device=device).expand(bsize)
+            
+            # denoise_step expects prefix_pad_masks and past_key_values to match x_t batch size
             v_t = flow_model.denoise_step(
                 x_t=x_t,
                 prefix_pad_masks=expanded_pad_masks,
