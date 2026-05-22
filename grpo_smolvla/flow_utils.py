@@ -54,14 +54,23 @@ def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
     bsize = noise.shape[0]
     device = noise.device
 
+    # Expand prefix cache to match the batch size of the noise tensor
+    expanded_pad_masks = prefix_cache["prefix_pad_masks"].expand(bsize, -1)
+    
+    # Expand past_key_values. It's a tuple of tuples: ( (key, value), (key, value), ... )
+    expanded_past_key_values = tuple(
+        (k.expand(bsize, -1, -1, -1), v.expand(bsize, -1, -1, -1))
+        for k, v in prefix_cache["past_key_values"]
+    )
+
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         for step in range(num_steps):
             time = 1.0 + step * dt
             time_tensor = torch.tensor(time, dtype=noise.dtype, device=device).expand(bsize)
             v_t = flow_model.denoise_step(
                 x_t=x_t,
-                prefix_pad_masks=prefix_cache["prefix_pad_masks"],
-                past_key_values=prefix_cache["past_key_values"],
+                prefix_pad_masks=expanded_pad_masks,
+                past_key_values=expanded_past_key_values,
                 timestep=time_tensor,
             )
             x_t = x_t + dt * v_t
@@ -70,33 +79,38 @@ def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
 
 def sample_group_trajectories(policy, obs_batch, n_group=8):
     """
-    Sample n_group independent trajectories from the policy for a single observation.
+    Sample n_group independent trajectories from the policy for a single observation
+    in PARALLEL.
 
-    Calls embed_prefix once (expensive VLM + KV-cache forward) and reuses the KV
-    cache across all n_group noise vectors and all 3 denoising horizons per vector.
-
-    Actions are trimmed to original_action_dim (e.g. 7 for LIBERO) — matching what
-    SmolVLAPolicy._get_action_chunk does — so they are compatible with the postprocessor.
-    The noise tensor stays at max_action_dim (32) for correct FM loss computation.
+    Calls embed_prefix once (expensive VLM + KV-cache forward). Generates all n_group
+    noise vectors as a single batch, expanding the KV cache. Runs denoising for 8, 9,
+    and 10 steps on the full batch.
 
     Returns list of dicts, each with keys: noise, actions_8, actions_9, actions_10.
     """
     model = policy.model  # VLAFlowMatching
-    B = 1
-    action_shape = (B, model.config.chunk_size, model.config.max_action_dim)
+    action_shape = (n_group, model.config.chunk_size, model.config.max_action_dim)
     device = next(policy.parameters()).device
     model_dtype = next(policy.parameters()).dtype
-    # Trim denoised actions to the original (non-padded) action dim, matching lerobot's
-    # _get_action_chunk which does: actions = actions[:, :, :original_action_dim]
     original_action_dim = policy.config.action_feature.shape[0]
 
     prefix_cache = compute_prefix_cache(policy, obs_batch)
 
+    # Generate all noise vectors at once
+    z_batch = torch.randn(action_shape, device=device, dtype=model_dtype)
+
+    # Denoise all trajectories in parallel
+    a8_batch  = rollout_with_n_steps(model, prefix_cache, z_batch, num_steps=8)[:, :, :original_action_dim]
+    a9_batch  = rollout_with_n_steps(model, prefix_cache, z_batch, num_steps=9)[:, :, :original_action_dim]
+    a10_batch = rollout_with_n_steps(model, prefix_cache, z_batch, num_steps=10)[:, :, :original_action_dim]
+
+    # Unpack batch into individual trajectory dicts
     group = []
-    for _ in range(n_group):
-        zi = torch.randn(action_shape, device=device, dtype=model_dtype)
-        a8  = rollout_with_n_steps(model, prefix_cache, zi, num_steps=8)[:, :, :original_action_dim]
-        a9  = rollout_with_n_steps(model, prefix_cache, zi, num_steps=9)[:, :, :original_action_dim]
-        a10 = rollout_with_n_steps(model, prefix_cache, zi, num_steps=10)[:, :, :original_action_dim]
-        group.append({"noise": zi, "actions_8": a8, "actions_9": a9, "actions_10": a10})
+    for i in range(n_group):
+        group.append({
+            "noise": z_batch[i].unsqueeze(0),
+            "actions_8": a8_batch[i].unsqueeze(0),
+            "actions_9": a9_batch[i].unsqueeze(0),
+            "actions_10": a10_batch[i].unsqueeze(0)
+        })
     return group
