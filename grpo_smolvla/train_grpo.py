@@ -8,6 +8,7 @@ import random
 os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
 
 import imageio
+import numpy as np
 import torch
 import wandb
 import yaml
@@ -23,7 +24,7 @@ from safetensors.torch import load_file
 
 from grpo_smolvla.flow_utils import sample_group_trajectories
 from grpo_smolvla.grpo import compute_grpo_advantages, grpo_update, flow_matching_log_prob
-from grpo_smolvla.rewards import compute_weighted_reward
+from grpo_smolvla.rewards import ParallelRewardRunner
 
 
 def load_config(path):
@@ -143,12 +144,17 @@ def train(cfg):
     suite = bd[cfg["task_suite"]]()
     n_tasks = suite.get_num_tasks()
 
+    # Initialize Parallel Reward Runner
+    print(f"Initializing {cfg['n_group']} environment workers ...")
+    reward_runner = ParallelRewardRunner(cfg["task_suite"], n_workers=cfg["n_group"])
+
     os.makedirs(cfg["output_dir"], exist_ok=True)
 
     print(f"Starting GRPO training for {cfg['total_steps']} steps ...")
     for step in range(cfg["total_steps"]):
         task_id = random.randint(0, n_tasks - 1)
-
+        
+        # We need a local env only to get the initial observation and task language
         env = LiberoEnv(
             task_suite=suite,
             task_id=task_id,
@@ -159,7 +165,18 @@ def train(cfg):
         )
 
         try:
+            # Sample a random init state index to pass to workers
+            n_states = len(suite.get_task_init_states(task_id))
+            init_state_idx = random.randint(0, n_states - 1)
+            
+            # Reset local env to get observation
             obs, info = env.reset()
+            # Sync local env with our chosen init_state_idx
+            obs = env._env.set_init_state(suite.get_task_init_states(task_id)[init_state_idx])
+            # Stabilize local env too so obs matches what workers see
+            import numpy as np
+            for _ in range(10): env.step(np.zeros(7))
+            
             task_language = env.task_description
         except Exception as e:
             print(f"  [step {step}] env reset failed: {e} — skipping")
@@ -177,12 +194,10 @@ def train(cfg):
             # Sample group of n trajectories (prefix KV-cache computed once for all n)
             group_data = sample_group_trajectories(policy, obs_batch, n_group=cfg["n_group"])
 
-            # Compute weighted rewards from the shared initial sim state
-            raw_env = env._env  # OffScreenRenderEnv — needed for sim state save/restore
-            rewards = []
-            for traj in group_data:
-                r = compute_weighted_reward(raw_env, traj, postprocessor)
-                rewards.append(r)
+            # Compute rewards for the whole group in parallel on CPU
+            rewards = reward_runner.compute_batch_rewards(
+                task_id, init_state_idx, group_data, postprocessor
+            )
             
             # Check for diversity: if we have more than one unique reward value, we're good
             if len(set(rewards)) > 1 or max_retries == 0:
@@ -229,6 +244,7 @@ def train(cfg):
 
     final_path = os.path.join(cfg["output_dir"], f"step_{cfg['total_steps']}")
     policy.save_pretrained(final_path)
+    reward_runner.close()
     print(f"Training complete. Final checkpoint → {final_path}")
 
 
