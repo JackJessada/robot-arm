@@ -41,6 +41,38 @@ def compute_prefix_cache(policy, obs_batch):
     }
 
 
+def expand_kv(pkv, bsize):
+    """
+    Safely expand past_key_values to a new batch size.
+    Handles nested tuples, transformers Cache objects, and flat tensor lists.
+    """
+    if pkv is None:
+        return None
+    
+    # Handle newer Transformers Cache objects (DynamicCache, etc.)
+    if hasattr(pkv, "batch_repeat"):
+        return pkv.batch_repeat(bsize)
+    
+    if isinstance(pkv, tuple):
+        res = []
+        for item in pkv:
+            if isinstance(item, (tuple, list)):
+                # Nested structure: ( (k, v), (k, v), ... )
+                res.append(tuple(
+                    t.expand(bsize, *t.shape[1:]) if isinstance(t, torch.Tensor) else t
+                    for t in item
+                ))
+            elif isinstance(item, torch.Tensor):
+                # Flat structure: ( t1, t2, ... )
+                res.append(item.expand(bsize, *item.shape[1:]))
+            else:
+                # Keep as-is (handles the 'int' that caused the error)
+                res.append(item)
+        return tuple(res)
+    
+    return pkv
+
+
 def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
     """
     Run Euler integration for num_steps steps from a fixed noise tensor.
@@ -56,12 +88,7 @@ def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
 
     # Expand prefix cache to match the batch size of the noise tensor
     expanded_pad_masks = prefix_cache["prefix_pad_masks"].expand(bsize, -1)
-    
-    # Expand past_key_values. It's a tuple of tuples: ( (key, value), (key, value), ... )
-    expanded_past_key_values = tuple(
-        (k.expand(bsize, -1, -1, -1), v.expand(bsize, -1, -1, -1))
-        for k, v in prefix_cache["past_key_values"]
-    )
+    expanded_past_key_values = expand_kv(prefix_cache["past_key_values"], bsize)
 
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
         for step in range(num_steps):
