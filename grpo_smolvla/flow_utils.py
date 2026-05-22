@@ -43,51 +43,28 @@ def compute_prefix_cache(policy, obs_batch):
 
 def expand_kv(pkv, bsize):
     """
-    Safely expand past_key_values to a new batch size.
-    Handles nested tuples (standard Transformers format).
+    Recursively expand all tensors in a nested structure (dict, list, tuple)
+    to a new batch size.
     """
     if pkv is None:
         return None
     
-    # DEBUG: Inspect the first layer's structure
-    print(f"DEBUG: pkv type: {type(pkv)}")
-    if isinstance(pkv, (list, tuple)) and len(pkv) > 0:
-        first_layer = pkv[0]
-        print(f"DEBUG: first layer type: {type(first_layer)}")
-        if isinstance(first_layer, dict):
-            print(f"DEBUG: first layer keys: {first_layer.keys()}")
-            for k, v in first_layer.items():
-                if isinstance(v, torch.Tensor):
-                    print(f"DEBUG: key '{k}' shape: {v.shape}")
-        elif isinstance(first_layer, (tuple, list)):
-            for i, v in enumerate(first_layer):
-                if isinstance(v, torch.Tensor):
-                    print(f"DEBUG: index {i} shape: {v.shape}")
-
-    # Handle newer Transformers Cache objects (DynamicCache, etc.)
+    if isinstance(pkv, torch.Tensor):
+        # Expand tensor: (1, ...) -> (bsize, ...)
+        return pkv.expand(bsize, *pkv.shape[1:])
+    
+    if isinstance(pkv, dict):
+        return {k: expand_kv(v, bsize) for k, v in pkv.items()}
+    
+    if isinstance(pkv, list):
+        return [expand_kv(v, bsize) for v in pkv]
+    
+    if isinstance(pkv, tuple):
+        return tuple(expand_kv(v, bsize) for v in pkv)
+    
+    # Handle Transformers Cache objects
     if hasattr(pkv, "batch_repeat"):
         return pkv.batch_repeat(bsize)
-    
-    if isinstance(pkv, (tuple, list)):
-        res = []
-        for item in pkv:
-            if isinstance(item, dict):
-                # Handle list of dicts: [ {"key_states": t1, "value_states": t2}, ... ]
-                new_dict = {}
-                for k, v in item.items():
-                    new_dict[k] = v.expand(bsize, *v.shape[1:]) if isinstance(v, torch.Tensor) else v
-                res.append(new_dict)
-            elif isinstance(item, (tuple, list)):
-                # Standard format: tuple of (key_states, value_states) per layer
-                res.append(tuple(
-                    t.expand(bsize, *t.shape[1:]) if isinstance(t, torch.Tensor) else t
-                    for t in item
-                ))
-            elif isinstance(item, torch.Tensor):
-                res.append(item.expand(bsize, *item.shape[1:]))
-            else:
-                res.append(item)
-        return tuple(res) if isinstance(pkv, tuple) else res
     
     return pkv
 
@@ -106,9 +83,7 @@ def rollout_with_n_steps(flow_model, prefix_cache, noise, num_steps):
     device = noise.device
 
     # Expand prefix cache to match the batch size of the noise tensor
-    # expanded_pad_masks: (B, seq_len)
     expanded_pad_masks = prefix_cache["prefix_pad_masks"].expand(bsize, -1)
-    # expanded_past_key_values: nested tuples with batch dimension bsize
     expanded_past_key_values = expand_kv(prefix_cache["past_key_values"], bsize)
 
     with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
